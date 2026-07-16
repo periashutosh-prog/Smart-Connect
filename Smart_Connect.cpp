@@ -2,6 +2,24 @@
 
 static const uint8_t BROADCAST_ADDR[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+// ESP8266 esp_now_send takes non-const pointers; wrap to keep call sites clean
+#ifndef ARDUINO_ARCH_ESP32
+static inline int sc_espnow_send(const uint8_t* peer, const uint8_t* data, int len) {
+  return esp_now_send((uint8_t*)peer, (uint8_t*)data, len);
+}
+#define esp_now_send(peer, data, len) sc_espnow_send(peer, data, len)
+#endif
+
+// Cooperative-safe short sleep: real task yield on ESP32, plain delay() (which
+// pumps the ESP8266 SDK background tasks) on ESP8266.
+static inline void sc_delay(uint32_t ms) {
+#ifdef ARDUINO_ARCH_ESP32
+  vTaskDelay(pdMS_TO_TICKS(ms));
+#else
+  delay(ms);
+#endif
+}
+
 Smart_Connect* Smart_Connect::_instance = nullptr;
 
 // =============================================================================
@@ -17,8 +35,10 @@ Smart_Connect::Smart_Connect()
     _telemetryPending(false), _removePeerPending(false), _addPeerPending(false),
     _display(nullptr),
     _buttons(0), _analog1(0), _analog2(0),
-    _pin(0), _peerAdded(false),
-    _taskHandle(nullptr), _mutex(nullptr)
+    _pin(0), _peerAdded(false)
+#ifdef ARDUINO_ARCH_ESP32
+    , _taskHandle(nullptr), _mutex(nullptr)
+#endif
 {
   memset(_telemetryBuf, 0, sizeof(_telemetryBuf));
   memset(_peerMac, 0, sizeof(_peerMac));
@@ -37,7 +57,9 @@ void Smart_Connect::setup(String name, int oledSda, int oledScl, bool smartConne
   _priority = priority;
   _instance = this;
 
+#ifdef ARDUINO_ARCH_ESP32
   _mutex = xSemaphoreCreateMutex();
+#endif
 
   // I2C + OLED
   Wire.begin(_sda, _scl);
@@ -58,27 +80,40 @@ void Smart_Connect::setup(String name, int oledSda, int oledScl, bool smartConne
   // Pin to channel 1 — without this, the TX and RX may end up on different
   // default channels and unicast packets drop silently while broadcasts (the
   // advertise/scan pair) still propagate. Channel 1 is the ESP-NOW default.
+#ifdef ARDUINO_ARCH_ESP32
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
+#else
+  wifi_set_channel(1);
+#endif
 
   // Own MAC
   String mac = WiFi.macAddress();
   mac.toCharArray(_macStr, sizeof(_macStr));
 
-  // ESP-NOW
-  if (esp_now_init() != ESP_OK) {
+  // ESP-NOW (esp_now_init returns 0 on success on both cores; ESP_OK is ESP32-only)
+  if (esp_now_init() != 0) {
     Serial.println(F("[SC] esp_now_init failed"));
     return;
   }
+#ifndef ARDUINO_ARCH_ESP32
+  // ESP8266 refuses to send unless a self-role is set. This node both receives
+  // CMDs and sends replies (ACK/telemetry), so it must be COMBO.
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+#endif
   esp_now_register_recv_cb(_recvCB);
 
   // Broadcast peer for advertising
+#ifdef ARDUINO_ARCH_ESP32
   esp_now_peer_info_t bcast = {};
   memcpy(bcast.peer_addr, BROADCAST_ADDR, 6);
   bcast.channel = 0;
   bcast.encrypt = false;
   esp_now_add_peer(&bcast);
+#else
+  esp_now_add_peer((uint8_t*)BROADCAST_ADDR, ESP_NOW_ROLE_COMBO, 1, NULL, 0);
+#endif
 
   // Default telemetry
   strncpy(_telemetryBuf, "NO DATA", sizeof(_telemetryBuf));
@@ -90,13 +125,29 @@ void Smart_Connect::setup(String name, int oledSda, int oledScl, bool smartConne
 }
 
 // =============================================================================
-// RUN — starts FreeRTOS task (call once from user's setup())
+// RUN — ESP32: start the FreeRTOS receiver task (call once from setup()).
+//       ESP8266: no FreeRTOS, so just arm cooperative mode — the sketch must
+//       call tick() every loop().
 // =============================================================================
 void Smart_Connect::run() {
   if (_running) return;
   _running = true;
+#ifdef ARDUINO_ARCH_ESP32
   xTaskCreatePinnedToCore(_taskFunc, "SC_RX", 8192, this, _priority, &_taskHandle, 0);
   Serial.println(F("[SC] Task started on core 0"));
+#else
+  Serial.println(F("[SC] Cooperative mode — call tick() every loop()"));
+#endif
+}
+
+// =============================================================================
+// TICK — ESP8266 cooperative driver. On ESP32 the task already runs _loop(),
+//        so this is a harmless no-op (safe to leave in shared sketches).
+// =============================================================================
+void Smart_Connect::tick() {
+#ifndef ARDUINO_ARCH_ESP32
+  if (_running) _loop();
+#endif
 }
 
 // =============================================================================
@@ -106,11 +157,11 @@ String Smart_Connect::readAll() {
   uint16_t btn;
   uint8_t a1, a2;
 
-  if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+  if (_lock(5)) {
     btn = _buttons;
     a1  = _analog1;
     a2  = _analog2;
-    xSemaphoreGive(_mutex);
+    _unlock();
   } else {
     btn = 0; a1 = 0; a2 = 0;
   }
@@ -132,16 +183,17 @@ ReceiverState Smart_Connect::getState() {
 }
 
 void Smart_Connect::setTelemetry(const char* data) {
-  if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+  if (_lock(5)) {
     strncpy(_telemetryBuf, data, sizeof(_telemetryBuf) - 1);
     _telemetryBuf[sizeof(_telemetryBuf) - 1] = '\0';
-    xSemaphoreGive(_mutex);
+    _unlock();
   }
 }
 
 // =============================================================================
-// FreeRTOS TASK
+// FreeRTOS TASK (ESP32 only — ESP8266 drives _loop() cooperatively via tick())
 // =============================================================================
+#ifdef ARDUINO_ARCH_ESP32
 void Smart_Connect::_taskFunc(void* param) {
   Smart_Connect* self = (Smart_Connect*)param;
   for (;;) {
@@ -149,6 +201,7 @@ void Smart_Connect::_taskFunc(void* param) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+#endif
 
 // =============================================================================
 // MAIN LOOP — state machine + display refresh
@@ -187,7 +240,7 @@ void Smart_Connect::_loop() {
       fail.pkt_id = SC_PKT_CONNECT_FAIL;
       for (int i = 0; i < 3; i++) {
         esp_now_send(_peerMac, (const uint8_t*)&fail, sizeof(fail));
-        vTaskDelay(pdMS_TO_TICKS(30));
+        sc_delay(30);
       }
     }
   }
@@ -246,7 +299,7 @@ void Smart_Connect::_loop() {
         _lastPartialOkSent = now;
         ScPartialOkPacket ok;
         ok.pkt_id = SC_PKT_PARTIAL_OK;
-        esp_err_t r = esp_now_send(_peerMac, (const uint8_t*)&ok, sizeof(ok));
+        int r = esp_now_send(_peerMac, (const uint8_t*)&ok, sizeof(ok));
         if (first) Serial.printf("[SC] PARTIAL_OK send result=%d\n", (int)r);
       }
       if ((long)(now - _stateTimestamp) > 90000) {
@@ -334,11 +387,11 @@ void Smart_Connect::_loop() {
       } else {
         _removePeer();
         // Reset command state
-        if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (_lock(10)) {
           _buttons = 0;
           _analog1 = 0;
           _analog2 = 0;
-          xSemaphoreGive(_mutex);
+          _unlock();
         }
         _state = RX_ADVERTISING;
         _stateTimestamp = now;
@@ -380,9 +433,9 @@ void Smart_Connect::_sendTelemetry() {
   TelemetryPacket pkt;
   pkt.pkt_id = PKT_TELEMETRY;
   memset(pkt.data, 0, sizeof(pkt.data));
-  if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+  if (_lock(5)) {
     strncpy(pkt.data, _telemetryBuf, sizeof(pkt.data) - 1);
-    xSemaphoreGive(_mutex);
+    _unlock();
   }
   esp_now_send(_peerMac, (const uint8_t*)&pkt, sizeof(pkt));
 }
@@ -393,12 +446,17 @@ void Smart_Connect::_sendTelemetry() {
 void Smart_Connect::_addPeer(const uint8_t* mac) {
   if (_peerAdded) return;
   memcpy(_peerMac, mac, 6);
-  esp_now_del_peer(mac);              // clear any stale registration first
+#ifdef ARDUINO_ARCH_ESP32
+  esp_now_del_peer(mac);
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, mac, 6);
   peer.channel = 0;
   peer.encrypt = false;
   esp_err_t r = esp_now_add_peer(&peer);
+#else
+  esp_now_del_peer((uint8_t*)mac);
+  int r = esp_now_add_peer((uint8_t*)mac, ESP_NOW_ROLE_SLAVE, 1, NULL, 0);
+#endif
   Serial.printf("[SC] add_peer %02X:%02X:%02X:%02X:%02X:%02X result=%d\n",
     mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], (int)r);
   _peerAdded = true;
@@ -406,7 +464,11 @@ void Smart_Connect::_addPeer(const uint8_t* mac) {
 
 void Smart_Connect::_removePeer() {
   if (!_peerAdded) return;
+#ifdef ARDUINO_ARCH_ESP32
   esp_now_del_peer(_peerMac);
+#else
+  esp_now_del_peer((uint8_t*)_peerMac);
+#endif
   memset(_peerMac, 0, 6);
   memset(_txName, 0, sizeof(_txName));
   _peerAdded = false;
@@ -470,7 +532,11 @@ void Smart_Connect::_onReceive(const uint8_t* mac, const uint8_t* data, int len)
     _txName[sizeof(_txName) - 1] = '\0';
 
     // Generate random 4-digit PIN via hardware RNG
+#ifdef ARDUINO_ARCH_ESP32
     _pin = (int)(esp_random() % 10000);
+#else
+    _pin = (int)(os_random() % 10000);
+#endif
 
     _state = RX_PIN_WAIT;
     _stateTimestamp = millis();
@@ -523,11 +589,11 @@ void Smart_Connect::_onReceive(const uint8_t* mac, const uint8_t* data, int len)
       Serial.println(F("[SC] CMD arrived during handshake — promoting to CONNECTED"));
     }
 
-    if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+    if (_lock(2)) {
       _buttons = cmd.buttons;
       _analog1 = cmd.analog1;
       _analog2 = cmd.analog2;
-      xSemaphoreGive(_mutex);
+      _unlock();
     }
 
     static uint16_t lastLoggedButtons = 0xFFFF;
@@ -553,13 +619,19 @@ void Smart_Connect::_onReceive(const uint8_t* mac, const uint8_t* data, int len)
 // =============================================================================
 // ESP-NOW RECEIVE CALLBACK TRAMPOLINE
 // =============================================================================
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 1)
-void Smart_Connect::_recvCB(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-  if (_instance) _instance->_onReceive(info->src_addr, data, len);
-}
+#ifdef ARDUINO_ARCH_ESP32
+  #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 1)
+  void Smart_Connect::_recvCB(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+    if (_instance) _instance->_onReceive(info->src_addr, data, len);
+  }
+  #else
+  void Smart_Connect::_recvCB(const uint8_t* mac, const uint8_t* data, int len) {
+    if (_instance) _instance->_onReceive(mac, data, len);
+  }
+  #endif
 #else
-void Smart_Connect::_recvCB(const uint8_t* mac, const uint8_t* data, int len) {
-  if (_instance) _instance->_onReceive(mac, data, len);
+void Smart_Connect::_recvCB(uint8_t* mac, uint8_t* data, uint8_t len) {
+  if (_instance) _instance->_onReceive(mac, data, (int)len);
 }
 #endif
 
@@ -744,9 +816,9 @@ void Smart_Connect::_drawActive() {
   _drawCentered("CONNECTED", 10);
 
   uint16_t btn; uint8_t a1, a2;
-  if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+  if (_lock(5)) {
     btn = _buttons; a1 = _analog1; a2 = _analog2;
-    xSemaphoreGive(_mutex);
+    _unlock();
   } else {
     btn = 0; a1 = 0; a2 = 0;
   }

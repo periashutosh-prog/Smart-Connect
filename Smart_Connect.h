@@ -2,13 +2,22 @@
 #define SMART_CONNECT_H
 
 #include <Arduino.h>
-#include <esp_now.h>
-#include <esp_idf_version.h>
-#include <esp_wifi.h>
-#include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+
+#ifdef ARDUINO_ARCH_ESP32
+  #include <WiFi.h>
+  #include <esp_now.h>
+  #include <esp_idf_version.h>
+  #include <esp_wifi.h>
+#else
+  #include <ESP8266WiFi.h>
+  #include <espnow.h>
+  extern "C" {
+    #include <user_interface.h>   // wifi_set_channel()
+  }
+#endif
 
 // =============================================================================
 // PACKET IDS — ESP_NOW
@@ -121,6 +130,7 @@ public:
 
   void    setup(String name, int oledSda, int oledScl, bool smartConnect, int priority);
   void    run();
+  void    tick();          // ESP8266: call every loop() (cooperative). ESP32: no-op (task drives it).
   String  readAll();
   bool    isConnected();
   ReceiverState getState();
@@ -187,12 +197,24 @@ private:
   // Own MAC
   char _macStr[18];
 
-  // FreeRTOS
+  // Concurrency — ESP32 uses a FreeRTOS task + mutex. ESP8266 (Arduino/NONOS
+  // core) has no FreeRTOS: _loop() runs cooperatively from tick(), and the
+  // ESP-NOW recv callback only fires when the system yields (never mid-
+  // instruction), so no mutex is needed there.
+#ifdef ARDUINO_ARCH_ESP32
   TaskHandle_t      _taskHandle;
   SemaphoreHandle_t _mutex;
+  bool _lock(uint32_t ms)  { return xSemaphoreTake(_mutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
+  void _unlock()           { xSemaphoreGive(_mutex); }
+#else
+  bool _lock(uint32_t ms)  { (void)ms; return true; }
+  void _unlock()           {}
+#endif
 
   // Internal
+#ifdef ARDUINO_ARCH_ESP32
   static void _taskFunc(void* param);
+#endif
   void _loop();
   void _advertise();
   void _sendTelemetry();
@@ -214,10 +236,14 @@ private:
 
   // ESP-NOW callback trampoline
   static Smart_Connect* _instance;
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 1)
-  static void _recvCB(const esp_now_recv_info_t* info, const uint8_t* data, int len);
+#ifdef ARDUINO_ARCH_ESP32
+  #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 1)
+    static void _recvCB(const esp_now_recv_info_t* info, const uint8_t* data, int len);
+  #else
+    static void _recvCB(const uint8_t* mac, const uint8_t* data, int len);
+  #endif
 #else
-  static void _recvCB(const uint8_t* mac, const uint8_t* data, int len);
+  static void _recvCB(uint8_t* mac, uint8_t* data, uint8_t len);
 #endif
 };
 
