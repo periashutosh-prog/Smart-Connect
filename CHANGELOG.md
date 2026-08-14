@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-08-11
+
+### Added
+- **Optional display in ESP_NOW mode.** `setup()` now probes the I2C bus for a
+  display (raw address ACK check at `0x3C`) before touching the SSD1306
+  driver. If nothing responds and the receiver is in plain `ESP_NOW` mode
+  (no PIN screen ever needed), it now logs a note and continues running fully
+  headless instead of getting stuck during display init.
+- **Blocking wait with a clear message in Smart Connect mode.** Smart Connect
+  has no fallback way to show the pairing PIN, so if no display is detected
+  at startup, `setup()` now prints `"[SC] Display Absent... Please connect
+  display to proceed"` and re-probes every 500ms (re-printing every 3s) until
+  one is found, rather than silently running a mode that could never actually
+  complete pairing.
+- **ESP8266 I2C clock-stretch failsafe.** `Wire.setClockStretchLimit(150000)`
+  bounds any I2C wait to 150ms. Previously, a floating or misbehaving I2C bus
+  (missing pull-ups, bad wiring — common on general-purpose boards like plain
+  NodeMCU, which don't have onboard I2C pull-ups the way a purpose-built
+  receiver PCB does) could hang `setup()` indefinitely before it ever reached
+  ESP-NOW init, which looked identical to "not advertising" from the outside.
+
+### Changed
+- All display draw calls in the state machine (`_drawAdvertising`,
+  `_drawConnecting`, `_drawPinScreen`, `_drawConnected`, `_drawActive`,
+  `_drawDisconnected`) are now gated on a new internal `_hasDisplay` flag, so
+  none of them ever run against a null display pointer.
+
 ## [1.5.0] - 2026-07-16
 
 ### Added

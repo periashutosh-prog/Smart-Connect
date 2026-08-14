@@ -175,8 +175,11 @@ private:
   // while TX->RX always worked. Flag it here, do the real add in _loop().
   volatile bool _addPeerPending;
 
-  // Display
+  // Display — optional in ESP_NOW mode (advertising/handshake is fully
+  // automatic and needs no screen), required in Smart Connect mode (the PIN
+  // has no other way to reach the user). See setup() for the probe/wait logic.
   Adafruit_SSD1306* _display;
+  bool _hasDisplay;
 
   // Received command data (guarded by _mutex)
   volatile uint16_t _buttons;

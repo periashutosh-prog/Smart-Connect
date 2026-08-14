@@ -33,7 +33,7 @@ Smart_Connect::Smart_Connect()
     _lastConnOkSent(0), _lastPartialOkSent(0), _lastConnectOkSent(0),
     _ackPending(false), _connectResultPending(0),
     _telemetryPending(false), _removePeerPending(false), _addPeerPending(false),
-    _display(nullptr),
+    _display(nullptr), _hasDisplay(false),
     _buttons(0), _analog1(0), _analog2(0),
     _pin(0), _peerAdded(false)
 #ifdef ARDUINO_ARCH_ESP32
@@ -63,14 +63,59 @@ void Smart_Connect::setup(String name, int oledSda, int oledScl, bool smartConne
 
   // I2C + OLED
   Wire.begin(_sda, _scl);
+#ifndef ARDUINO_ARCH_ESP32
+  // Failsafe: bound clock-stretch waits to 150ms instead of the ESP8266 Wire
+  // library's effectively-unbounded default, so a floating/misbehaving I2C
+  // bus can't hang setup() indefinitely.
+  Wire.setClockStretchLimit(150000);
+#endif
   Wire.setClock(400000);  // 400kHz for faster display updates
   delay(50);
-  _display = new Adafruit_SSD1306(128, 64, &Wire, -1);
-  if (!_display->begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("[SC] SSD1306 init failed"));
+
+  // Probe for a display before touching the SSD1306 driver at all — a raw
+  // address ACK is the cheapest way to tell "nothing here" from "here, but
+  // broken", and lets us skip Adafruit_SSD1306::begin() entirely when there's
+  // genuinely no device on the bus.
+  Wire.beginTransmission(0x3C);
+  _hasDisplay = (Wire.endTransmission() == 0);
+
+  if (!_hasDisplay) {
+    if (_smartConnect) {
+      // Smart Connect's entire pairing flow depends on showing the PIN on
+      // screen — there's no fallback path to communicate it any other way —
+      // so block here and keep re-probing rather than silently running a mode
+      // that can never actually complete pairing.
+      Serial.println(F("[SC] Display Absent... Please connect display to proceed"));
+      unsigned long lastMsg = millis();
+      while (!_hasDisplay) {
+        delay(500);
+        Wire.beginTransmission(0x3C);
+        _hasDisplay = (Wire.endTransmission() == 0);
+        if (!_hasDisplay && millis() - lastMsg >= 3000) {
+          lastMsg = millis();
+          Serial.println(F("[SC] Display Absent... Please connect display to proceed"));
+        }
+      }
+      Serial.println(F("[SC] Display detected — continuing setup"));
+    } else {
+      // Plain ESP_NOW mode never needs the screen to function — pairing is
+      // fully automatic — so just carry on headless.
+      Serial.println(F("[SC] No display detected — continuing without display (ESP_NOW mode)"));
+    }
   }
-  _display->clearDisplay();
-  _display->display();
+
+  if (_hasDisplay) {
+    _display = new Adafruit_SSD1306(128, 64, &Wire, -1);
+    if (!_display->begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+      Serial.println(F("[SC] SSD1306 init failed"));
+      delete _display;
+      _display = nullptr;
+      _hasDisplay = false;
+    } else {
+      _display->clearDisplay();
+      _display->display();
+    }
+  }
 
   // WiFi off for ESP-NOW
   WiFi.mode(WIFI_STA);
@@ -260,7 +305,7 @@ void Smart_Connect::_loop() {
         _lastAdvTime = now;
         _advertise();
       }
-      if (now - _lastDisplayTime >= 200) {
+      if (_hasDisplay && now - _lastDisplayTime >= 200) {
         _lastDisplayTime = now;
         _drawAdvertising();
       }
@@ -284,7 +329,7 @@ void Smart_Connect::_loop() {
         _state = RX_ADVERTISING;
         _stateTimestamp = now;
       }
-      if (now - _lastDisplayTime >= 200) {
+      if (_hasDisplay && now - _lastDisplayTime >= 200) {
         _lastDisplayTime = now;
         _drawConnecting();
       }
@@ -308,7 +353,7 @@ void Smart_Connect::_loop() {
         _state = RX_ADVERTISING;
         _stateTimestamp = now;
       }
-      if (now - _lastDisplayTime >= 200) {
+      if (_hasDisplay && now - _lastDisplayTime >= 200) {
         _lastDisplayTime = now;
         _drawPinScreen();
       }
@@ -327,12 +372,12 @@ void Smart_Connect::_loop() {
       }
 
       bool showSplash = ((long)(now - _connectedSince) < 5000);
-      if (showSplash) {
+      if (_hasDisplay && showSplash) {
         if (now - _lastDisplayTime >= 500) {
           _lastDisplayTime = now;
           _drawConnected();
         }
-      } else {
+      } else if (_hasDisplay) {
         if (now - _lastDisplayTime >= 20) {  // 50 Hz active display refresh
           _lastDisplayTime = now;
           _drawActive();
@@ -380,7 +425,7 @@ void Smart_Connect::_loop() {
 
     case RX_DISCONNECTED: {
       if (now - _stateTimestamp < 2000) {
-        if (now - _lastDisplayTime >= 200) {
+        if (_hasDisplay && now - _lastDisplayTime >= 200) {
           _lastDisplayTime = now;
           _drawDisconnected();
         }
